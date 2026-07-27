@@ -8,22 +8,11 @@
 <meta name="theme-color" content="#0e8a8a">
 
 <!-- ============================================================
-     ▼▼▼ ここにご自身のFirebase設定を貼り付けてください ▼▼▼
-     未入力のままでも「ローカル保存モード」で動作します。
-     設定するとログイン＋クラウド保存モードになります。
+     接続設定は firebase-config.js に分離しています。
+     このHTMLを更新しても firebase-config.js は差し替え不要です。
+     （設定ファイルが無い場合はローカル保存モードで動作します）
      ============================================================ -->
-<script>
-  const FIREBASE_CONFIG = {
-    apiKey: "",              // 例: "AIzaSyD..."
-    authDomain: "",          // 例: "carenote-xxxx.firebaseapp.com"
-    projectId: "",           // 例: "carenote-xxxx"
-    storageBucket: "",
-    messagingSenderId: "",
-    appId: ""
-  };
-  // 事業所ID(複数事業所で分ける場合のみ変更)
-  const OFFICE_ID = "office1";
-</script>
+<script src="firebase-config.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
@@ -438,6 +427,10 @@
 <div id="toast" class="toast"></div>
 
 <script>
+/* 設定ファイル(firebase-config.js)が無い場合でも動くようにする */
+window.FIREBASE_CONFIG = window.FIREBASE_CONFIG || {};
+window.OFFICE_ID = window.OFFICE_ID || 'office1';
+
 /* ============================ データ層 ============================ */
 const LS_KEY = 'carenote_f1_v1';
 const CARE_LEVELS = ['要支援1','要支援2','要介護1','要介護2','要介護3','要介護4','要介護5'];
@@ -476,10 +469,20 @@ function defaultStaff(){ return [
 ]; }
 function defaultWage(role){ return role==='サービス提供責任者'?1800:role==='ヘルパー'?1500:0; }
 function defaultAllow(role){ return role==='サービス提供責任者'?25000:role==='ヘルパー'?5000:0; }
+/* 料金表(改定世代)。from=適用開始年月。月ごとに該当する世代が自動で選ばれる */
 function defaultSettings(){ return {
   office:{name:'ケアノート訪問介護事業所', number:'1370100000', area:'2級地'},
-  unitPrice:10.00, shoguuPct:0, tokuteiPct:0, units:Object.assign({},UNIT_DEFAULT)
+  revisions:[ {id:uid('rev'), from:'2000-01', label:'現行', unitPrice:10.00, shoguuPct:0, tokuteiPct:0, units:Object.assign({},UNIT_DEFAULT)} ]
 }; }
+/* 指定年月(YYYY-MM)に適用される料金表を返す */
+function revisionFor(month){
+  const revs=(DB.settings.revisions||[]).slice().sort((a,b)=>a.from.localeCompare(b.from));
+  if(!revs.length) return {from:'2000-01',label:'—',unitPrice:10,shoguuPct:0,tokuteiPct:0,units:Object.assign({},UNIT_DEFAULT)};
+  let cur=revs[0];
+  revs.forEach(r=>{ if(r.from<=month) cur=r; });
+  return cur;
+}
+function sortedRevisions(){ return (DB.settings.revisions||[]).slice().sort((a,b)=>b.from.localeCompare(a.from)); }
 function helperNames(){ return DB.staff.filter(s=>s.status==='在職'&&(s.role==='ヘルパー'||s.role==='サービス提供責任者')).map(s=>s.name); }
 function futanRate(f){ return f==='2割'?0.2:f==='3割'?0.3:0.1; }
 
@@ -545,8 +548,25 @@ function normalize(d){
   if(!d) d=seed();
   if(!d.staff||!d.staff.length) d.staff=defaultStaff();
   if(!d.settings) d.settings=defaultSettings();
-  if(!d.settings.units) d.settings.units=Object.assign({},UNIT_DEFAULT);
-  if(d.settings.tokuteiPct===undefined) d.settings.tokuteiPct=0;
+  if(!d.settings.office) d.settings.office=defaultSettings().office;
+  /* 旧形式(単一の単価・単位数)→ 改定世代リストへ自動移行 */
+  if(!Array.isArray(d.settings.revisions)||!d.settings.revisions.length){
+    d.settings.revisions=[{ id:uid('rev'), from:'2000-01', label:'現行',
+      unitPrice:(d.settings.unitPrice!==undefined?d.settings.unitPrice:10.00),
+      shoguuPct:(d.settings.shoguuPct||0), tokuteiPct:(d.settings.tokuteiPct||0),
+      units:Object.assign({},UNIT_DEFAULT,d.settings.units||{}) }];
+  }
+  /* 各世代に、アプリ更新で増えた新コードの初期値を補う(既存の値は保持) */
+  d.settings.revisions.forEach(r=>{
+    if(!r.id) r.id=uid('rev');
+    if(!r.from) r.from='2000-01';
+    if(!r.label) r.label='料金表';
+    if(r.unitPrice===undefined) r.unitPrice=10.00;
+    if(r.shoguuPct===undefined) r.shoguuPct=0;
+    if(r.tokuteiPct===undefined) r.tokuteiPct=0;
+    r.units=Object.assign({},UNIT_DEFAULT,r.units||{});
+  });
+  delete d.settings.units; delete d.settings.unitPrice; delete d.settings.shoguuPct; delete d.settings.tokuteiPct;
   if(!d.billFlags) d.billFlags={};
   if(!d.handovers) d.handovers=[];
   if(!d.reports) d.reports=[];
@@ -1029,8 +1049,14 @@ function delStaff(id){ const s=DB.staff.find(x=>x.id===id); const used=DB.visits
 /* ============================ 設定(F6) ============================ */
 function viewSettings(){
   const st=DB.settings;
-  const unitRows=Object.keys(st.units).map(code=>'<tr><td>'+esc(code)+'</td>'+
-    '<td class="num"><input class="fld" data-u="'+esc(code)+'" type="number" value="'+st.units[code]+'" style="width:120px;text-align:right;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font-weight:600"> 単位</td></tr>').join('');
+  const revs=sortedRevisions();
+  if(!ui.revId || !revs.some(r=>r.id===ui.revId)) ui.revId=revs[0].id;
+  const rev=revs.find(r=>r.id===ui.revId);
+  const nowRev=revisionFor(thisMonth());
+  const revTabs=revs.map(r=>'<span class="chip'+(r.id===ui.revId?' on':'')+'" onclick="ui.revId=\''+r.id+'\';render()">'+
+      esc(r.label)+' <span style="opacity:.75;font-weight:600">'+esc(r.from)+'〜</span>'+(r.id===nowRev.id?' ●':'')+'</span>').join('');
+  const unitRows=Object.keys(rev.units).map(code=>'<tr><td>'+esc(code)+'</td>'+
+    '<td class="num"><input data-u="'+esc(code)+'" type="number" value="'+rev.units[code]+'" style="width:120px;text-align:right;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font-weight:600;font-family:inherit"> 単位</td></tr>').join('');
   return '<div class="phead"><div><h1>設定</h1><div class="crumb">ホーム / 設定</div></div><div class="sp"></div>'+
       '<button class="btn primary" onclick="saveSettings()">保存</button></div>'+
     '<div class="card"><div class="sblock"><div style="height:10px"></div>'+
@@ -1039,23 +1065,53 @@ function viewSettings(){
         '<div class="fld"><label>事業所番号</label><input data-s="office.number" value="'+esc(st.office.number)+'"></div>'+
         '<div class="fld"><label>地域区分</label><input data-s="office.area" value="'+esc(st.office.area)+'"></div>'+
       '</div>'+
-      '<div style="height:18px"></div><div class="sectitle">単価・加算</div><div class="frm" style="display:grid;grid-template-columns:1fr 1fr;gap:14px 18px">'+
-        '<div class="fld"><label>1単位あたり単価(円)</label><input data-s="unitPrice" type="number" step="0.01" value="'+st.unitPrice+'"></div>'+
-        '<div class="fld"><label>特定事業所加算 率(%)</label><input data-s="tokuteiPct" type="number" step="0.1" value="'+(st.tokuteiPct||0)+'"></div>'+
-        '<div class="fld"><label>処遇改善加算 率(%)</label><input data-s="shoguuPct" type="number" step="0.1" value="'+st.shoguuPct+'"></div>'+
+      '<div style="height:20px"></div>'+
+      '<div style="display:flex;align-items:center;flex-wrap:wrap;gap:10px"><div class="sectitle" style="margin:0">料金表(改定世代)</div>'+
+        '<div style="margin-left:auto;display:flex;gap:8px"><button class="btn sm" onclick="addRevision()">＋ 改定を追加</button>'+
+        (revs.length>1?'<button class="btn sm danger" onclick="delRevision(\''+rev.id+'\')">この改定を削除</button>':'')+'</div></div>'+
+      '<div class="banner ok" style="margin:10px 0 12px">📅 請求は<b>対象月に適用される料金表</b>で計算されます。改定時は「＋改定を追加」で新しい世代を作れば、<b>過去月の金額は変わりません</b>。（●＝今月適用中）</div>'+
+      '<div class="chips" style="margin-bottom:14px">'+revTabs+'</div>'+
+      '<div class="frm" style="display:grid;grid-template-columns:1fr 1fr;gap:14px 18px">'+
+        '<div class="fld"><label>名称</label><input data-r="label" value="'+esc(rev.label)+'" placeholder="例: 2027年4月改定"></div>'+
+        '<div class="fld"><label>適用開始年月<span class="req">*</span></label><input data-r="from" type="month" value="'+esc(rev.from)+'"></div>'+
+        '<div class="fld"><label>1単位あたり単価(円)</label><input data-r="unitPrice" type="number" step="0.01" value="'+rev.unitPrice+'"></div>'+
+        '<div class="fld"><label>特定事業所加算 率(%)</label><input data-r="tokuteiPct" type="number" step="0.1" value="'+rev.tokuteiPct+'"></div>'+
+        '<div class="fld"><label>処遇改善加算 率(%)</label><input data-r="shoguuPct" type="number" step="0.1" value="'+rev.shoguuPct+'"></div>'+
       '</div>'+
-      '<div style="height:18px"></div><div class="sectitle">サービス単位数マスタ</div>'+
-      '<table class="settbl" style="margin-top:8px"><thead><tr><th>サービスコード / 時間区分</th><th style="text-align:right">単位数</th></tr></thead><tbody>'+unitRows+'</tbody></table>'+
-      '<div style="font-size:11.5px;color:var(--muted2);margin-top:10px">※ 単位数・単価はサンプル初期値です。実際の介護報酬・地域単価に合わせて調整してください。ここでの値が実績・請求の計算に反映されます。</div>'+
+      '<div style="height:16px"></div><div class="sectitle">サービス単位数（この料金表）</div>'+
+      '<div style="overflow-x:auto"><table class="settbl" style="margin-top:8px"><thead><tr><th>サービスコード / 時間区分</th><th style="text-align:right">単位数</th></tr></thead><tbody>'+unitRows+'</tbody></table></div>'+
+      '<div style="font-size:11.5px;color:var(--muted2);margin-top:10px">※ 初期値はサンプルです。実際の介護報酬・地域単価に合わせて調整してください。編集内容は「保存」を押すと反映されます。</div>'+
     '<div style="height:20px"></div></div></div>';
 }
-function saveSettings(){
-  const root=document.getElementById('main');
+function thisMonth(){ return '2026-07'; }
+function collectSettings(){
+  const root=document.getElementById('main'); if(!root) return;
   root.querySelectorAll('[data-s]').forEach(el=>{ const path=el.dataset.s.split('.'); let o=DB.settings;
     for(let i=0;i<path.length-1;i++)o=o[path[i]]; const k=path[path.length-1];
     o[k]= el.type==='number'? parseFloat(el.value)||0 : el.value.trim(); });
-  root.querySelectorAll('[data-u]').forEach(el=>{ DB.settings.units[el.dataset.u]=parseInt(el.value)||0; });
-  save(); toast('設定を保存しました'); render();
+  const rev=(DB.settings.revisions||[]).find(r=>r.id===ui.revId); if(!rev) return;
+  root.querySelectorAll('[data-r]').forEach(el=>{ const k=el.dataset.r;
+    rev[k]= el.type==='number'? (parseFloat(el.value)||0) : el.value.trim(); });
+  if(!rev.from) rev.from='2000-01';
+  if(!rev.label) rev.label='料金表';
+  root.querySelectorAll('[data-u]').forEach(el=>{ rev.units[el.dataset.u]=parseInt(el.value)||0; });
+}
+function saveSettings(){ collectSettings(); save(); toast('設定を保存しました'); render(); }
+function addRevision(){
+  collectSettings();
+  const base=(DB.settings.revisions||[]).find(r=>r.id===ui.revId)||revisionFor(thisMonth());
+  const nr={ id:uid('rev'), from:'2027-04', label:'新しい改定',
+    unitPrice:base.unitPrice, shoguuPct:base.shoguuPct, tokuteiPct:base.tokuteiPct,
+    units:Object.assign({},base.units) };
+  DB.settings.revisions.push(nr); ui.revId=nr.id; save(); render();
+  toast('現在の内容を複製しました。適用開始年月と単位数を変更してください');
+}
+function delRevision(id){
+  if((DB.settings.revisions||[]).length<=1){ toast('料金表は1つ以上必要です'); return; }
+  const r=DB.settings.revisions.find(x=>x.id===id);
+  if(!confirm('料金表「'+r.label+'（'+r.from+'〜）」を削除します。よろしいですか?')) return;
+  DB.settings.revisions=DB.settings.revisions.filter(x=>x.id!==id);
+  ui.revId=sortedRevisions()[0].id; save(); render(); toast('削除しました');
 }
 
 /* ============================ 実施記録(F2) ============================ */
@@ -1135,7 +1191,7 @@ function deleteRecord(id,visitId){ DB.records=DB.records.filter(r=>r.id!==id); c
 /* ============================ 実績・請求(F4/F5) ============================ */
 function billMonths(){ const ms=[...new Set(DB.records.map(r=>r.date.slice(0,7)))]; if(!ms.includes(ui.billMonth))ms.push(ui.billMonth); return ms.sort().reverse(); }
 function billFor(userId,month){
-  const st=DB.settings;
+  const st=revisionFor(month);   // ← 対象月に適用される料金表を使用(過去月は当時の単価のまま)
   const recs=DB.records.filter(r=>r.userId===userId&&r.status==='confirmed'&&r.date.slice(0,7)===month);
   const g={}; recs.forEach(r=>{ g[r.code]=(g[r.code]||0)+1; });
   const items=Object.keys(g).map(code=>({code,count:g[code],unit:st.units[code]||0,units:g[code]*(st.units[code]||0)}));
@@ -1161,7 +1217,7 @@ function billFor(userId,month){
   return {items,base,initial,initialAuto,initialOn,emgCount,emergency,tokutei,shoguu,total,cost,futan,kyufu,rate,count:recs.length};
 }
 function viewBilling(){
-  const month=ui.billMonth; const st=DB.settings;
+  const month=ui.billMonth; const st=revisionFor(month);
   const users=DB.users.filter(u=>DB.records.some(r=>r.userId===u.id&&r.status==='confirmed'&&r.date.slice(0,7)===month));
   const monthOpts=billMonths().map(m=>'<option '+(m===month?'selected':'')+'>'+m+'</option>').join('');
   let tUnits=0,tCost=0,tFutan=0,tKyufu=0;
@@ -1186,7 +1242,7 @@ function viewBilling(){
       '<button class="btn primary" onclick="exportCSV()">⬇ 国保連CSVを出力</button></div>'+
     '<div class="toolbar" style="padding-bottom:8px"><div class="sel" style="box-shadow:none">対象月</div>'+
       '<select class="sel" onchange="ui.billMonth=this.value;render()">'+monthOpts+'</select>'+
-      '<div class="sp" style="flex:1"></div><div class="sel" style="box-shadow:none">単価 '+st.unitPrice.toFixed(2)+'円 / 処遇改善 '+st.shoguuPct+'%</div></div>'+
+      '<div class="sp" style="flex:1"></div><div class="sel" style="box-shadow:none" title="この月に適用される料金表">📅 '+esc(st.label)+'（'+esc(st.from)+'〜）・単価 '+st.unitPrice.toFixed(2)+'円 / 処遇改善 '+st.shoguuPct+'%</div></div>'+
     '<div class="card"><table><thead><tr><th>利用者</th><th>サービス内訳</th><th class="num">基本単位</th><th>加算(自動判定)</th><th class="num">合計単位</th><th class="num">費用総額</th><th class="num">利用者負担</th><th></th></tr></thead>'+
       '<tbody>'+rows+'</tbody></table>'+
       (users.length?'<div class="bill-sum"><div class="b">合計単位数<b>'+tUnits.toLocaleString()+'</b></div><div class="b">費用総額<b>¥'+tCost.toLocaleString()+'</b></div><div class="b">保険給付<b>¥'+tKyufu.toLocaleString()+'</b></div><div class="b">利用者負担 合計<b>¥'+tFutan.toLocaleString()+'</b></div></div>':'')+
@@ -1214,7 +1270,7 @@ function exportCSV(){
   const head=['対象月','利用者名','被保険者番号','保険者番号','サービス内訳','基本単位','初回加算','緊急時加算','特定事業所加算','処遇改善加算','合計単位','単価','費用総額','保険給付','負担割合','利用者負担'];
   const lines=[head.join(',')];
   users.forEach(u=>{ const b=billFor(u.id,month); const bd=b.items.map(i=>i.code.split('(')[0]+'x'+i.count).join(' / ');
-    lines.push([month,u.name,u.hokenNo,u.hokensha,'"'+bd+'"',b.base,b.initial,b.emergency,b.tokutei,b.shoguu,b.total,DB.settings.unitPrice,b.cost,b.kyufu,u.futan,b.futan].join(',')); });
+    lines.push([month,u.name,u.hokenNo,u.hokensha,'"'+bd+'"',b.base,b.initial,b.emergency,b.tokutei,b.shoguu,b.total,revisionFor(month).unitPrice,b.cost,b.kyufu,u.futan,b.futan].join(',')); });
   const csv='﻿'+lines.join('\r\n');
   const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'});
   const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='国保連請求_'+month+'.csv'; a.click();
@@ -1421,8 +1477,9 @@ function viewDash(){
       trend.map(x=>{ const h=Math.round(x.n/maxT*100); return '<div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%"><div style="font-size:11px;font-weight:700;color:var(--ink2);margin-bottom:4px">'+x.n+'</div><div style="width:70%;height:'+Math.max(h,3)+'%;background:linear-gradient(180deg,var(--teal),var(--teal-d));border-radius:6px 6px 0 0"></div><div style="font-size:10.5px;color:var(--muted);margin-top:6px">'+x.name+'</div></div>'; }).join('')+'</div></div>'+
     '<div class="subcard"><h3>加算取得状況(当月)</h3><div class="bars"><div class="barrow"><div class="lab">初回加算</div><div style="color:var(--ink2);font-weight:700">'+initCount+' 名</div></div>'+
       '<div class="barrow"><div class="lab">緊急時訪問介護加算</div><div style="color:var(--ink2);font-weight:700">'+emgTotal+' 回</div></div>'+
-      '<div class="barrow"><div class="lab">特定事業所加算</div><div style="color:var(--ink2);font-weight:700">'+(DB.settings.tokuteiPct||0)+' %</div></div>'+
-      '<div class="barrow"><div class="lab">処遇改善加算</div><div style="color:var(--ink2);font-weight:700">'+(DB.settings.shoguuPct||0)+' %</div></div></div></div>'+
+      '<div class="barrow"><div class="lab">特定事業所加算</div><div style="color:var(--ink2);font-weight:700">'+revisionFor(month).tokuteiPct+' %</div></div>'+
+      '<div class="barrow"><div class="lab">処遇改善加算</div><div style="color:var(--ink2);font-weight:700">'+revisionFor(month).shoguuPct+' %</div></div>'+
+      '<div class="barrow"><div class="lab">適用料金表</div><div style="color:var(--ink2);font-weight:700">'+esc(revisionFor(month).label)+'（'+esc(revisionFor(month).from)+'〜）</div></div></div></div>'+
     '<div style="padding:0 26px 20px;font-size:11.5px;color:var(--muted2)">※ すべて当月データからの自動集計です。稼働率=実施済 ÷ 対象予定(キャンセル除く)。</div>';
 }
 
@@ -1545,7 +1602,11 @@ function viewIntegrations(){
   ];
   const cards=conns.map(c=>'<div class="integ"><div class="ic">'+c.ic+'</div><div style="flex:1"><h4>'+esc(c.name)+'</h4><p>'+esc(c.desc)+'</p>'+
     '<span class="st '+(c.on?'on':'off')+'">'+(c.on?'● 連携中':'未接続')+'</span></div><div>'+c.act+'</div></div>').join('');
+  const cloudCard= CLOUD
+    ? '<div class="banner ok" style="margin:0 26px 18px">☁️ クラウド保存モードで動作中です（事業所ID: <b>'+esc(OFFICE_ID)+'</b> / プロジェクト: '+esc(FIREBASE_CONFIG.projectId)+'）。データはFirestoreに自動保存されます。</div>'
+    : '<div class="banner warn" style="margin:0 26px 18px">💾 現在は<b>ローカル保存モード</b>です（このブラウザ内にのみ保存）。クラウド保存にするには、HTMLファイル冒頭の <b>FIREBASE_CONFIG</b> にFirebaseの設定を貼り付けてください。同梱の「Firebaseセットアップ手順」をご覧ください。</div>';
   return '<div class="phead"><div><h1>外部連携</h1><div class="crumb">ホーム / 外部連携</div></div></div>'+
+    cloudCard+
     '<div class="integ-grid">'+cards+'</div>'+
     '<div class="subcard" style="margin-top:0"><h3>データのバックアップ / 復元</h3>'+
       '<div style="padding:16px 20px;font-size:13px;color:var(--ink2)">全データ(利用者・予定・記録・実績・職員・設定など)をJSONファイルで書き出し・読み込みできます。'+
@@ -1559,7 +1620,10 @@ function viewIntegrations(){
 function exportBackup(){ const blob=new Blob([JSON.stringify(DB,null,2)],{type:'application/json'});
   const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='carenote_backup_2026-07-26.json'; a.click(); toast('バックアップを書き出しました'); }
 function importBackup(input){ const file=input.files[0]; if(!file)return; const rd=new FileReader();
-  rd.onload=e=>{ try{ const d=JSON.parse(e.target.result); if(!d.users)throw 0; DB=d; save(); ui=freshUi(); render(); toast('バックアップから復元しました'); }catch(err){ toast('ファイルの読み込みに失敗しました'); } };
+  rd.onload=e=>{ try{ const d=JSON.parse(e.target.result); if(!d.users)throw 0;
+    if(!confirm('現在のデータを、このバックアップの内容で置き換えます。よろしいですか?')) return;
+    DB=normalize(d); save(); ui=freshUi(); render(); toast('バックアップから復元しました'); }
+    catch(err){ toast('ファイルの読み込みに失敗しました'); } };
   rd.readAsText(file); }
 
 /* ============================ 使い方ガイド ============================ */
@@ -1573,6 +1637,8 @@ function openGuide(){
     ['シフト・給与・レポート','「シフト」で職員の稼働、「給与計算」で実働×時給を集計、「レポート」で稼働率や件数を確認できます。'],
     ['日誌の出力','「実施記録」→「📘日誌を出力」で、日次・月次・年次を選んで業務日誌を印刷・CSV出力できます。'],
     ['バックアップ','「外部連携」からデータをJSONで書き出し・復元できます。右上の ↺ で初期データに戻せます。'],
+    ['保存モードの確認','画面上部のバッジが「クラウド保存」ならFirestoreに自動保存、「ローカル保存」ならこのブラウザ内のみに保存されます。スマホからも同じURLでログインできます。'],
+    ['報酬改定への対応','「設定」→料金表で「＋改定を追加」を押し、適用開始年月（例:2027-04）と新しい単位数・率を入力します。請求は対象月の料金表で計算されるため、過去月の金額は変わりません。'],
   ];
   const body=steps.map((s,i)=>'<div class="guide-step"><div class="guide-n">'+(i+1)+'</div><div><h4>'+esc(s[0])+'</h4><p>'+esc(s[1])+'</p></div></div>').join('');
   showModal('<div class="modal"><div class="mhead"><h3>ケアノートの使い方</h3><span class="x" onclick="closeModal()">✕</span></div>'+
@@ -1639,9 +1705,53 @@ function exportDiaryCSV(){
   const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='日誌_'+diaryLabel(type,val).replace(/[年月]/g,'-').replace(/-$/,'')+'.csv'; a.click(); toast('日誌CSVを出力しました');
 }
 
-/* ============================ 起動 ============================ */
-render();
-if(!STORAGE_OK) showStorageWarning();
+/* ============================ 認証・起動 ============================ */
+function showLogin(show){
+  document.getElementById('loginScreen').style.display = show?'flex':'none';
+  document.getElementById('appRoot').style.display = show?'none':'';
+}
+function doLogin(ev){
+  ev.preventDefault();
+  const email=document.getElementById('loginEmail').value.trim();
+  const pass=document.getElementById('loginPass').value;
+  const err=document.getElementById('loginErr'); const btn=document.getElementById('loginBtn');
+  err.style.display='none'; btn.disabled=true; btn.textContent='ログイン中…';
+  fbAuth.signInWithEmailAndPassword(email,pass).catch(e=>{
+    const m={'auth/invalid-credential':'メールアドレスまたはパスワードが違います',
+             'auth/invalid-email':'メールアドレスの形式が正しくありません',
+             'auth/user-not-found':'アカウントが見つかりません',
+             'auth/wrong-password':'パスワードが違います',
+             'auth/too-many-requests':'試行回数が多すぎます。しばらく待って再度お試しください',
+             'auth/network-request-failed':'ネットワークに接続できません'};
+    err.textContent=m[e.code]||('ログインできません（'+e.code+'）'); err.style.display='block';
+  }).finally(()=>{ btn.disabled=false; btn.textContent='ログイン'; });
+}
+function doLogout(){ if(CLOUD && confirm('ログアウトしますか?')) fbAuth.signOut(); }
+
+async function bootCloud(){
+  firebase.initializeApp(FIREBASE_CONFIG);
+  fbAuth=firebase.auth(); fbDb=firebase.firestore();
+  document.getElementById('logoutBtn').style.display='';
+  document.getElementById('dataNote').textContent='※ データはFirestore(クラウド)に保存されます。事業所ID: '+OFFICE_ID;
+  fbAuth.onAuthStateChanged(async user=>{
+    if(!user){ showLogin(true); return; }
+    showLogin(false);
+    document.getElementById('whoami').textContent=user.email||'';
+    document.getElementById('avatarChip').textContent=(user.email||'?').charAt(0).toUpperCase();
+    setSyncState('saving');
+    try{ await cloudLoad(); setSyncState('saved'); }
+    catch(e){ console.error(e); setSyncState('error');
+      alert('データの読み込みに失敗しました。\nFirestoreのセキュリティルールと、ログインアカウントの権限をご確認ください。\n\n'+(e.message||e)); }
+    ui=freshUi(); render();
+  });
+}
+
+if(CLOUD){ bootCloud(); }
+else {
+  showLogin(false);
+  render();
+  if(!STORAGE_OK) showStorageWarning();
+}
 </script>
 </body>
 </html>
